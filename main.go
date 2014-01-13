@@ -23,8 +23,8 @@ var keepBufferFiles bool
 var debug bool
 var shouldOutputVersion bool
 var hostsStr string
-var hosts []string
 var config *configfile.ConfigFile
+var clusterId string
 
 const (
 	VERSION                            = "0.1"
@@ -38,6 +38,7 @@ type ChunkBuffer struct {
 	FilePath       *string
 	MaxAgeInMins   int64
 	MaxSizeInBytes int64
+	ClusterId      *string
 	Topic          *string
 	Partition      int64
 	Offset         uint64
@@ -47,6 +48,7 @@ type ChunkBuffer struct {
 }
 
 type BackupTask struct {
+	ClusterId string
 	Topic     string
 	Partition int64
 	Offset    uint64
@@ -68,7 +70,6 @@ func (chunkBuffer *ChunkBuffer) CreateBufferFileOrPanic() {
 }
 
 func (chunkBuffer *ChunkBuffer) TooBig() bool {
-	fmt.Println("check size", chunkBuffer.length, ">=", chunkBuffer.MaxSizeInBytes)
 	return chunkBuffer.length >= chunkBuffer.MaxSizeInBytes
 }
 
@@ -80,8 +81,7 @@ func (chunkBuffer *ChunkBuffer) NeedsRotation() bool {
 	return chunkBuffer.TooBig() || chunkBuffer.TooOld()
 }
 
-func FetchLastCommittedOffset(bucket *s3.Bucket, topic *string, partition int64) (uint64, error) {
-	prefix := S3TopicPartitionPrefix(topic, partition)
+func FetchLastCommittedOffset(bucket *s3.Bucket, prefix string) (uint64, error) {
 	keyMarker := ""
 
 	// First, do a few checks for shortcuts for checking backwards: focus in on the 14 days.
@@ -143,20 +143,32 @@ func S3DatePrefix(t *time.Time) string {
 	return fmt.Sprintf("%d/%d/%d/", t.Year(), t.Month(), t.Day())
 }
 
-func S3TopicPartitionPrefix(topic *string, partition int64) string {
-	return fmt.Sprintf("%s/p%d/", *topic, partition)
+func S3TopicPartitionPrefix(clusterId string, topic string, partition int64) string {
+	if clusterId != "" {
+		return fmt.Sprintf("%s/%s/%d/", clusterId, topic, partition)
+	} else {
+		return fmt.Sprintf("%s/%d/", topic, partition)
+	}
 }
 
-func KafkaMsgGuidPrefix(topic *string, partition int64) string {
-	return fmt.Sprintf("t_%s-p_%d-o_", *topic, partition)
+func (this *ChunkBuffer) S3TopicPartitionPrefix() string {
+	return S3TopicPartitionPrefix(*this.ClusterId, *this.Topic, this.Partition)
 }
 
-func S3KafkaChunkKey(topic *string, partition int64, startOffset uint64, endOffset uint64) string {
-	return fmt.Sprintf("clusterid_%s_%d_%d_%d", *topic, partition, startOffset, endOffset)
+func (this *ChunkBuffer) KafkaMsgGuidPrefix() string {
+	return fmt.Sprintf("t_%s-p_%d-o_", *this.Topic, this.Partition)
+}
+
+func (this *ChunkBuffer) S3KafkaChunkKey() string {
+	if *this.ClusterId != "" {
+		return fmt.Sprintf("%s_%s_%d_%d_%d", *this.ClusterId, *this.Topic, this.Partition, this.InitialOffset, this.Offset)
+	} else {
+		return fmt.Sprintf("%s_%d_%d_%d", *this.Topic, this.Partition, this.InitialOffset, this.Offset)
+	}
 }
 
 func (chunkBuffer *ChunkBuffer) PutMessage(msg *sarama.ConsumerEvent) {
-	uuid := []byte(fmt.Sprintf("%s%d|", KafkaMsgGuidPrefix(chunkBuffer.Topic, chunkBuffer.Partition), msg.Offset))
+	uuid := []byte(fmt.Sprintf("%s%d|", chunkBuffer.KafkaMsgGuidPrefix(), msg.Offset))
 	lf := []byte("\n")
 	chunkBuffer.Offset = uint64(msg.Offset)
 	chunkBuffer.File.Write(uuid)
@@ -186,10 +198,11 @@ func (chunkBuffer *ChunkBuffer) StoreToS3AndRelease(s3bucket *s3.Bucket) (bool, 
 		}
 	} else { // Write to s3 in a new filename
 		alreadyExists := true
-		chunkkey := S3KafkaChunkKey(chunkBuffer.Topic, chunkBuffer.Partition, chunkBuffer.InitialOffset, chunkBuffer.Offset)
+		chunkkey := chunkBuffer.S3KafkaChunkKey()
 		for alreadyExists {
 			writeTime := time.Now()
-			s3path = fmt.Sprintf("%s%s%s", S3TopicPartitionPrefix(chunkBuffer.Topic, chunkBuffer.Partition), S3DatePrefix(&writeTime), chunkkey)
+			s3Prefix := chunkBuffer.S3TopicPartitionPrefix()
+			s3path = fmt.Sprintf("%s%s%s", s3Prefix, S3DatePrefix(&writeTime), chunkkey)
 			alreadyExists, err = s3bucket.Exists(s3path)
 			if err != nil {
 				panic(err)
@@ -264,6 +277,7 @@ func doBackup(s3bucket *s3.Bucket, client *sarama.Client, backupTask BackupTask)
 	buffer := &ChunkBuffer{FilePath: &tempfilePath,
 		MaxSizeInBytes: bufferMaxSizeInByes,
 		MaxAgeInMins:   bufferMaxAgeInMinutes,
+		ClusterId:      &backupTask.ClusterId,
 		Topic:          &backupTask.Topic,
 		Partition:      backupTask.Partition,
 		Offset:         backupTask.Offset,
@@ -303,6 +317,7 @@ consumerLoop:
 				buffer = &ChunkBuffer{FilePath: &tempfilePath,
 					MaxSizeInBytes: bufferMaxSizeInByes,
 					MaxAgeInMins:   bufferMaxAgeInMinutes,
+					ClusterId:      &backupTask.ClusterId,
 					Topic:          &backupTask.Topic,
 					Partition:      backupTask.Partition,
 					Offset:         uint64(event.Offset) + 1,
@@ -313,7 +328,6 @@ consumerLoop:
 				if debug {
 					fmt.Printf("Rotating into %s\n", buffer.File.Name())
 				}
-
 			}
 
 			msgCount += 1
@@ -330,15 +344,21 @@ func init() {
 	flag.BoolVar(&keepBufferFiles, "k", false, "keep buffer files around for inspection")
 	flag.BoolVar(&shouldOutputVersion, "v", false, "output the current version and quit")
 	flag.StringVar(&hostsStr, "h", "localhost:9092", "host:port comma separated list")
-	hosts = strings.Split(hostsStr, ",")
+	flag.StringVar(&clusterId, "i", "", "ID of the Kafka cluster")
 }
 
 func main() {
 	flag.Parse() // Read argv
 
+	hosts := strings.Split(hostsStr, ",")
+
+	if shouldOutputVersion {
+		fmt.Printf("kafka-s3-consumer %s\n", VERSION)
+		os.Exit(0)
+	}
+
 	var backupTasks []BackupTask
 
-	println("config file name", configFilename)
 	var err error
 	// Read configuration file
 	config, err = configfile.ReadConfigFile(configFilename)
@@ -346,12 +366,7 @@ func main() {
 		fmt.Printf("Couldn't read config file %s because: %#v\n", configFilename, err)
 		panic(err)
 	}
-	// host, _ := config.GetString("kafka", "host")
 	debug, _ = config.GetBool("default", "debug")
-	// bufferMaxSizeInByes, _ := config.GetInt64("default", "maxchunksizebytes")
-	// bufferMaxAgeInMinutes, _ := config.GetInt64("default", "maxchunkagemins")
-	// port, _ := config.GetString("kafka", "port")
-	// hostname := fmt.Sprintf("%s:%s", host, port)
 	awsKey, _ := config.GetString("s3", "accesskey")
 	awsSecret, _ := config.GetString("s3", "secretkey")
 	awsRegion, _ := config.GetString("s3", "region")
@@ -364,7 +379,8 @@ func main() {
 		println(err.Error())
 	}
 
-	// figure out list of topicpartitions & their offsets to backup
+	// figure out list of topicpartitions & their last backed up offset
+	// create list of backup tasks
 	topics, _ := client.Topics()
 	for _, topic := range topics {
 		println("Topic:", topic)
@@ -372,16 +388,18 @@ func main() {
 		for _, partition := range partitions {
 			println("Partition:", partition)
 
-			offset, err := FetchLastCommittedOffset(s3bucket, &topic, int64(partition))
+			s3Prefix := S3TopicPartitionPrefix(clusterId, topic, int64(partition))
+			offset, err := FetchLastCommittedOffset(s3bucket, s3Prefix)
 			if err != nil {
 				println(err.Error())
 				continue
 			}
-			backupTask := BackupTask{Offset: offset, Topic: topic, Partition: int64(partition)}
+			backupTask := BackupTask{Offset: offset, ClusterId: clusterId, Topic: topic, Partition: int64(partition)}
 			backupTasks = append(backupTasks, backupTask)
 		}
 	}
 
+	// perform the backup tasks
 	for _, backupTask := range backupTasks {
 		doBackup(s3bucket, client, backupTask)
 	}

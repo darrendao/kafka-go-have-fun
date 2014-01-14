@@ -25,6 +25,7 @@ var shouldOutputVersion bool
 var hostsStr string
 var config *configfile.ConfigFile
 var clusterId string
+var topicsStr string
 
 const (
 	VERSION                            = "0.1"
@@ -339,18 +340,35 @@ consumerLoop:
 	fmt.Println("Got", msgCount, "messages.")
 }
 
+func topicNeedsBackup(topicsToBackup []string, topic string) bool {
+	if len(topicsToBackup) < 1 {
+		return false
+	} else if topicsToBackup[0] == "*" {
+		return true
+	}
+
+	for _, t := range topicsToBackup {
+		if t == topic {
+			return true
+		}
+	}
+	return false
+}
+
 func init() {
 	flag.StringVar(&configFilename, "c", "consumer.properties", "path to config file")
 	flag.BoolVar(&keepBufferFiles, "k", false, "keep buffer files around for inspection")
 	flag.BoolVar(&shouldOutputVersion, "v", false, "output the current version and quit")
 	flag.StringVar(&hostsStr, "h", "localhost:9092", "host:port comma separated list")
 	flag.StringVar(&clusterId, "i", "", "ID of the Kafka cluster")
+	flag.StringVar(&topicsStr, "t", "*", "comma separated list of topics. Defaults to all.")
 }
 
 func main() {
 	flag.Parse() // Read argv
 
 	hosts := strings.Split(hostsStr, ",")
+	topicsToBackup := strings.Split(topicsStr, ",")
 
 	if shouldOutputVersion {
 		fmt.Printf("kafka-s3-consumer %s\n", VERSION)
@@ -384,6 +402,11 @@ func main() {
 	topics, _ := client.Topics()
 	for _, topic := range topics {
 		println("Topic:", topic)
+
+		if !topicNeedsBackup(topicsToBackup, topic) {
+			println("Skipping", topic, "because it does not need to be backed up")
+			continue
+		}
 		partitions, _ := client.Partitions(topic)
 		for _, partition := range partitions {
 			println("Partition:", partition)

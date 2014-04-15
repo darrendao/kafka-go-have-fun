@@ -25,7 +25,7 @@ var clusterId string
 const (
 	VERSION                            = "0.1"
 	ONE_MINUTE_IN_NANOS                = 60000000000
-	S3_REWIND_IN_DAYS_BEFORE_LONG_LOOP = 60
+	S3_REWIND_IN_DAYS_BEFORE_LONG_LOOP = 7
 	DAY_IN_SECONDS                     = 24 * 60 * 60
 )
 
@@ -48,6 +48,13 @@ type BackupTask struct {
 	Topic     string
 	Partition int64
 	Offset    uint64
+}
+
+type errorNoOffset struct {
+}
+
+func (e *errorNoOffset) Error() string {
+	return "Cannot find offset"
 }
 
 func (chunkBuffer *ChunkBuffer) BaseFilename() string {
@@ -77,6 +84,7 @@ func (chunkBuffer *ChunkBuffer) NeedsRotation() bool {
 	return chunkBuffer.TooBig() || chunkBuffer.TooOld()
 }
 
+// Look at S3 to see what was the last committed offset
 func FetchLastCommittedOffset(bucket *s3.Bucket, prefix string, topic string, partition int64) (uint64, error) {
 	keyMarker := ""
 
@@ -98,6 +106,7 @@ func FetchLastCommittedOffset(bucket *s3.Bucket, prefix string, topic string, pa
 
 	lastKey := ""
 	offset := uint64(0)
+	foundOffset := false
 	moreResults := true
 	for moreResults {
 		results, err := bucket.List(prefix, "", keyMarker, 0)
@@ -118,10 +127,30 @@ func FetchLastCommittedOffset(bucket *s3.Bucket, prefix string, topic string, pa
 		moreResults = results.IsTruncated
 
 		offset = DetermineOffset(bucket, lastKey, topic, partition)
+		foundOffset = true
 	}
-	return offset, nil
+
+	if foundOffset {
+		return offset, nil
+	} else {
+		return offset, &errorNoOffset{}
+	}
 }
 
+// Figure out what offset to start backing up for
+func FetchOffsetToBackup(bucket *s3.Bucket, prefix string, topic string, partition int64) (uint64, error) {
+	nobackupYet := &errorNoOffset{}
+	offset, err := FetchLastCommittedOffset(bucket, prefix, topic, partition)
+	if err != nil && err.Error() == nobackupYet.Error() {
+		return 0, nil
+	} else if err == nil {
+		return offset + 1, nil
+	} else {
+		return 0, err
+	}
+}
+
+// Given an s3 obj, find out the last offset inside it
 func DetermineOffset(s3bucket *s3.Bucket, latestKey string, topic string, partition int64) (offset uint64) {
 	contentBytes, err := s3bucket.Get(latestKey)
 	guidPrefix := KafkaMsgGuidPrefix(&topic, partition)
@@ -226,13 +255,13 @@ func (chunkBuffer *ChunkBuffer) StoreToS3AndRelease(s3bucket *s3.Bucket) (bool, 
 		}
 	} else { // Write to s3 in a new filename
 		alreadyExists := true
-		// chunkkey := chunkBuffer.S3KafkaChunkKey()
+		chunkkey := chunkBuffer.S3KafkaChunkKey()
 		for alreadyExists {
 			writeTime := time.Now()
 			s3Prefix := chunkBuffer.S3TopicPartitionPrefix()
 			// s3path = fmt.Sprintf("%s%s%s", s3Prefix, S3DatePrefix(&writeTime), chunkkey)
 			println("Writing out to", s3Prefix)
-			s3path = fmt.Sprintf("%s%s%d", s3Prefix, S3DatePrefix(&writeTime), writeTime.UnixNano())
+			s3path = fmt.Sprintf("%s%s%d-%s", s3Prefix, S3DatePrefix(&writeTime), writeTime.UnixNano(), chunkkey)
 			alreadyExists, err = s3bucket.Exists(s3path)
 			if err != nil {
 				panic(err)
@@ -261,44 +290,43 @@ func (chunkBuffer *ChunkBuffer) StoreToS3AndRelease(s3bucket *s3.Bucket) (bool, 
 	return true, nil
 }
 
-func LastS3KeyWithPrefix(bucket *s3.Bucket, prefix *string) (string, error) {
-	narrowedPrefix := *prefix
-	keyMarker := ""
+// func LastS3KeyWithPrefix(bucket *s3.Bucket, prefix *string) (string, error) {
+// 	narrowedPrefix := *prefix
+// 	keyMarker := ""
 
-	// First, do a few checks for shortcuts for checking backwards: focus in on the 14 days.
-	// Otherwise just loop forward until there aren't any more results
-	currentDay := time.Now()
-	for i := 0; i < S3_REWIND_IN_DAYS_BEFORE_LONG_LOOP; i++ {
-		testPrefix := fmt.Sprintf("%s%s", *prefix, S3DatePrefix(&currentDay))
-		results, err := bucket.List(narrowedPrefix, "", keyMarker, 0)
-		if err != nil && len(results.Contents) > 0 {
-			narrowedPrefix = testPrefix
-			break
-		}
-		currentDay = currentDay.Add(-1 * time.Duration(DAY_IN_SECONDS) * time.Second)
-	}
+// 	// First, do a few checks for shortcuts for checking backwards: focus in on the 14 days.
+// 	// Otherwise just loop forward until there aren't any more results
+// 	currentDay := time.Now()
+// 	for i := 0; i < S3_REWIND_IN_DAYS_BEFORE_LONG_LOOP; i++ {
+// 		testPrefix := fmt.Sprintf("%s%s", *prefix, S3DatePrefix(&currentDay))
+// 		results, err := bucket.List(narrowedPrefix, "", keyMarker, 0)
+// 		if err != nil && len(results.Contents) > 0 {
+// 			narrowedPrefix = testPrefix
+// 			break
+// 		}
+// 		currentDay = currentDay.Add(-1 * time.Duration(DAY_IN_SECONDS) * time.Second)
+// 	}
 
-	lastKey := ""
-	moreResults := true
-	for moreResults {
-		results, err := bucket.List(narrowedPrefix, "", keyMarker, 0)
-		if err != nil {
-			return lastKey, err
-		}
+// 	lastKey := ""
+// 	moreResults := true
+// 	for moreResults {
+// 		results, err := bucket.List(narrowedPrefix, "", keyMarker, 0)
+// 		if err != nil {
+// 			return lastKey, err
+// 		}
 
-		if len(results.Contents) == 0 { // empty request, return last found lastKey
-			return lastKey, nil
-		}
+// 		if len(results.Contents) == 0 { // empty request, return last found lastKey
+// 			return lastKey, nil
+// 		}
 
-		lastKey = results.Contents[len(results.Contents)-1].Key
-		keyMarker = lastKey
-		moreResults = results.IsTruncated
-	}
-	return lastKey, nil
-}
+// 		lastKey = results.Contents[len(results.Contents)-1].Key
+// 		keyMarker = lastKey
+// 		moreResults = results.IsTruncated
+// 	}
+// 	return lastKey, nil
+// }
 
 func doBackup(s3bucket *s3.Bucket, client *sarama.Client, backupTask BackupTask) {
-
 	fmt.Println("doing backup for", backupTask)
 	bufferMaxSizeInByes, _ := config.GetInt64("default", "maxchunksizebytes")
 	bufferMaxAgeInMinutes, _ := config.GetInt64("default", "maxchunkagemins")
@@ -338,7 +366,6 @@ consumerLoop:
 				panic(event.Err)
 			}
 			buffer.PutMessage(event)
-			// println(string(event.Value), event.Offset)
 
 			// check for max size and max age ... if over, rotate
 			// to new buffer file and upload the old one.
@@ -408,7 +435,7 @@ func Backup(p_config *configfile.ConfigFile, p_clusterId string, hosts []string,
 		println(err.Error())
 	}
 
-	// figure out list of topicpartitions & their last backed up offset
+	// figure out list of topicpartitions & what starting offset we need to backup
 	// create list of backup tasks
 	topics, _ := client.Topics()
 	for _, topic := range topics {
@@ -423,13 +450,13 @@ func Backup(p_config *configfile.ConfigFile, p_clusterId string, hosts []string,
 			println("Partition:", partition)
 
 			s3Prefix := S3TopicPartitionPrefix(clusterId, topic, int64(partition))
-			offset, err := FetchLastCommittedOffset(s3bucket, s3Prefix, topic, int64(partition))
+			offset, err := FetchOffsetToBackup(s3bucket, s3Prefix, topic, int64(partition))
 			println("OFFSET is", offset)
 			if err != nil {
 				println(err.Error())
 				continue
 			}
-			backupTask := BackupTask{Offset: offset + 1, ClusterId: clusterId, Topic: topic, Partition: int64(partition)}
+			backupTask := BackupTask{Offset: offset, ClusterId: clusterId, Topic: topic, Partition: int64(partition)}
 			backupTasks = append(backupTasks, backupTask)
 		}
 	}
@@ -438,22 +465,4 @@ func Backup(p_config *configfile.ConfigFile, p_clusterId string, hosts []string,
 	for _, backupTask := range backupTasks {
 		doBackup(s3bucket, client, backupTask)
 	}
-}
-
-func Buggy(config *configfile.ConfigFile) {
-	clusterId = "6-demo1"
-
-	s3Prefix := "6-demo1/test/0/"
-	awsKey, _ := config.GetString("s3", "accesskey")
-	awsSecret, _ := config.GetString("s3", "secretkey")
-	awsRegion, _ := config.GetString("s3", "region")
-	s3BucketName, _ := config.GetString("s3", "bucket")
-
-	s3bucket := s3.New(aws.Auth{AccessKey: awsKey, SecretKey: awsSecret}, aws.Regions[awsRegion]).Bucket(s3BucketName)
-
-	res, _ := FetchLastCommittedOffset(s3bucket, s3Prefix, "test", 0)
-	println(res)
-
-	// newres, _ := LastS3KeyWithPrefix(s3bucket, &s3Prefix)
-	// println(newres)
 }

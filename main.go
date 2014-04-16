@@ -45,11 +45,13 @@ func init() {
 	flag.StringVar(&topicsStr, "t", "*", "comma separated list of topics. Defaults to all.")
 }
 
-func mainreplay() {
+func main() {
+	config, _ = configfile.ReadConfigFile(configFilename)
+
 	targets := []string{"localhost:9092"}
 
-	startDate, err := time.Parse("2006-01-02", "2014-04-12")
-	endDate, _ := time.Parse("2006-01-02", "2014-04-12")
+	startDate, err := time.Parse("2006-01-02", "2014-04-15")
+	endDate, _ := time.Parse("2006-01-02", "2014-04-15")
 
 	if err != nil {
 		println(err.Error())
@@ -57,7 +59,7 @@ func mainreplay() {
 
 	println("startdate is", startDate.String())
 	fmt.Println(startDate)
-	s3replay.Replay(targets, "clusteridhere", "test2", 0, startDate, endDate)
+	s3replay.Replay(config, targets, "", "test4", 0, startDate, endDate)
 }
 
 func maintest() {
@@ -83,7 +85,7 @@ func maintest() {
 	}
 }
 
-func main() {
+func mainbackup() {
 	flag.Parse() // Read argv
 
 	hosts := strings.Split(hostsStr, ",")

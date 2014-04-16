@@ -7,6 +7,8 @@ import (
 	"mime"
 	"os"
 	// "strconv"
+	"bytes"
+	"encoding/binary"
 	"github.com/crowdmob/goamz/aws"
 	"github.com/crowdmob/goamz/s3"
 	configfile "github.com/crowdmob/goconfig"
@@ -126,7 +128,8 @@ func FetchLastCommittedOffset(bucket *s3.Bucket, prefix string, topic string, pa
 		fmt.Println("offset", offset)
 		moreResults = results.IsTruncated
 
-		offset = DetermineOffset(bucket, lastKey, topic, partition)
+		// offset = DetermineOffset(bucket, lastKey, topic, partition)
+		_, offset = ParseS3KeyForOffsets(lastKey)
 		foundOffset = true
 	}
 
@@ -224,7 +227,7 @@ func (this *ChunkBuffer) S3KafkaChunkKey() string {
 	}
 }
 
-func (chunkBuffer *ChunkBuffer) PutMessage(msg *sarama.ConsumerEvent) {
+func (chunkBuffer *ChunkBuffer) OldPutMessage(msg *sarama.ConsumerEvent) {
 	uuid := []byte(fmt.Sprintf("%s%d|", chunkBuffer.KafkaMsgGuidPrefix(), msg.Offset))
 	lf := []byte("\n")
 	chunkBuffer.Offset = uint64(msg.Offset)
@@ -233,6 +236,20 @@ func (chunkBuffer *ChunkBuffer) PutMessage(msg *sarama.ConsumerEvent) {
 	chunkBuffer.File.Write(lf)
 
 	chunkBuffer.length += int64(len(uuid)) + int64(len(msg.Value)) + int64(len(lf))
+}
+
+func (chunkBuffer *ChunkBuffer) PutMessage(msg *sarama.ConsumerEvent) {
+	offsetBuff := new(bytes.Buffer)
+	binary.Write(offsetBuff, binary.LittleEndian, uint64(msg.Offset))
+	msgLengthBuff := new(bytes.Buffer)
+	msgLength := uint64(len(msg.Value))
+	binary.Write(msgLengthBuff, binary.LittleEndian, msgLength)
+
+	chunkBuffer.File.Write(offsetBuff.Bytes())
+	chunkBuffer.File.Write(msgLengthBuff.Bytes())
+	chunkBuffer.File.Write(msg.Value)
+	chunkBuffer.length += int64(len(offsetBuff.Bytes())) + int64(len(msgLengthBuff.Bytes())) + int64(len(msg.Value))
+	chunkBuffer.Offset = uint64(msg.Offset)
 }
 
 func (chunkBuffer *ChunkBuffer) StoreToS3AndRelease(s3bucket *s3.Bucket) (bool, error) {

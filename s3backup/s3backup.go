@@ -240,8 +240,11 @@ func (chunkBuffer *ChunkBuffer) OldPutMessage(msg *sarama.ConsumerEvent) {
 
 func (chunkBuffer *ChunkBuffer) PutMessage(msg *sarama.ConsumerEvent) {
 	offsetBuff := new(bytes.Buffer)
+	// ok to cast msg.Offset to uint64 since offset should be positive number
 	binary.Write(offsetBuff, binary.LittleEndian, uint64(msg.Offset))
 	msgLengthBuff := new(bytes.Buffer)
+
+	// ok to cast len to uint64 since it should be a positive number
 	msgLength := uint64(len(msg.Value))
 	binary.Write(msgLengthBuff, binary.LittleEndian, msgLength)
 
@@ -412,6 +415,11 @@ consumerLoop:
 			msgCount += 1
 		case <-time.After(5 * time.Second):
 			fmt.Println("> timed out")
+			// Backup any remaining data in the buffer
+			if buffer.length > 0 {
+				buffer.StoreToS3AndRelease(s3bucket)
+			}
+
 			break consumerLoop
 		}
 	}

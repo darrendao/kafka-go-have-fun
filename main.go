@@ -1,23 +1,12 @@
 package main
 
 import (
-	"fmt"
-	"github.com/Shopify/sarama"
-	"github.com/darrendao/kafka-go-have-fun/s3backup"
-	"github.com/darrendao/kafka-go-have-fun/s3replay"
-	// "io/ioutil"
-	// "mime"
-	"os"
-	// "strconv"
 	"flag"
-	// "github.com/crowdmob/goamz/aws"
-	// "github.com/crowdmob/goamz/s3"
+	"fmt"
 	configfile "github.com/crowdmob/goconfig"
-	// "path"
-	// "path/filepath"
-	// "strconv"
+	"github.com/darrendao/kafka-go-have-fun/s3backup"
+	"os"
 	"strings"
-	"time"
 )
 
 var configFilename string
@@ -46,46 +35,6 @@ func init() {
 }
 
 func main() {
-	config, _ = configfile.ReadConfigFile(configFilename)
-
-	targets := []string{"localhost:9092"}
-
-	startDate, err := time.Parse("2006-01-02", "2014-04-15")
-	endDate, _ := time.Parse("2006-01-02", "2014-04-15")
-
-	if err != nil {
-		println(err.Error())
-	}
-
-	println("startdate is", startDate.String())
-	fmt.Println(startDate)
-	s3replay.Replay(config, targets, "", "test4", 0, startDate, endDate)
-}
-
-func maintest() {
-	client, err := sarama.NewClient("client_id", []string{"localhost:9092"}, &sarama.ClientConfig{MetadataRetries: 1, WaitForElection: 250 * time.Millisecond})
-	if err != nil {
-		panic(err)
-	} else {
-		fmt.Println("> connected")
-	}
-	defer client.Close()
-
-	producer, err := sarama.NewProducer(client, &sarama.ProducerConfig{RequiredAcks: sarama.WaitForLocal, MaxBufferedBytes: 1024, MaxBufferTime: 1})
-	if err != nil {
-		panic(err)
-	}
-	defer producer.Close()
-
-	err = producer.SendMessage("test2", nil, sarama.StringEncoder("this is a line\nthis is another line\nand anothe rone asflas fls fk jsfasj lfskldfjl"))
-	if err != nil {
-		panic(err)
-	} else {
-		fmt.Println("> message sent")
-	}
-}
-
-func mainbackup() {
 	flag.Parse() // Read argv
 
 	hosts := strings.Split(hostsStr, ",")

@@ -3,6 +3,7 @@ package s3replay
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"github.com/Shopify/sarama"
 	"github.com/crowdmob/goamz/aws"
@@ -10,11 +11,24 @@ import (
 	configfile "github.com/crowdmob/goconfig"
 	"github.com/darrendao/kafka-go-have-fun/s3backup"
 	"io"
-	"regexp"
+	// "regexp"
+	"net/http"
+	// "net/url"
 	"strconv"
-	"strings"
+	// "strings"
 	"time"
 )
+
+type UpdateRequest struct {
+	Replay     ReplayStruct `json:"replay"`
+	User_email string       `json:"user_email"`
+	User_token string       `json:"user_token"`
+}
+
+type ReplayStruct struct {
+	Progress int    `json:"progress,omitempty"`
+	Result   string `json:"result,omitempty"`
+}
 
 var config *configfile.ConfigFile
 
@@ -23,7 +37,13 @@ const (
 	DAY_IN_SECONDS      = 24 * 60 * 60
 )
 
-func Replay(p_config *configfile.ConfigFile, targets []string, clusterId string, topic string, partition int, startDate time.Time, endDate time.Time) {
+func Replay(p_config *configfile.ConfigFile, targets []string, clusterId string, replayId int, topic string, partition int, startDate time.Time, endDate time.Time) {
+	println("H")
+	config = p_config
+	sendProgressUpdate(replayId, 10, 10)
+}
+
+func RealReplay(p_config *configfile.ConfigFile, targets []string, clusterId string, replayId int, topic string, partition int, startDate time.Time, endDate time.Time) {
 	config = p_config
 	s3keys := getS3Keys(clusterId, topic, partition, startDate, endDate)
 	awsKey, _ := config.GetString("s3", "accesskey")
@@ -50,8 +70,12 @@ func Replay(p_config *configfile.ConfigFile, targets []string, clusterId string,
 	defer producer.Close()
 
 	// TODO: we can parallelize at the partition level
-	for _, s3key := range s3keys {
+	s3keysCount := len(s3keys)
+	for i, s3key := range s3keys {
 		replayS3Obj(producer, s3bucket, s3key, topic, partitionKey)
+
+		// Update status
+		sendProgressUpdate(replayId, i, s3keysCount)
 	}
 }
 
@@ -117,40 +141,40 @@ func readMsg(reader io.Reader, msgLen uint64) []byte {
 	return buf
 }
 
-func oldreplayS3Obj(producer *sarama.Producer, s3bucket *s3.Bucket, s3key string, topic string, partitionKey KaasPartitionEncoder) {
-	contentBytes, err := s3bucket.Get(s3key)
-	if err != nil {
-		println(err.Error())
-		return
-	}
-	lines := strings.Split(string(contentBytes), "\n")
-	var data []byte = nil
-	for _, line := range lines {
-		// parse line to get actual data, ignoring the first token, which is metadata for topic id, offset, etc
-		if line != "" {
-			validKaasPrefix := regexp.MustCompile(`t_\w+-p_\d+-o_\d+\|`)
-			if validKaasPrefix.MatchString(line) {
-				if data != nil {
-					err := producer.SendMessage(topic, partitionKey, sarama.ByteEncoder(data))
-					if err != nil {
-						panic(err.Error())
-					}
-				}
-				tokens := strings.SplitN(line, "|", 2)
-				data = []byte(tokens[1])
-			} else {
-				data = append(data, []byte("\n")...)
-				data = append(data, []byte(line)...)
-			}
-		}
-	}
-	if data != nil {
-		err := producer.SendMessage(topic, partitionKey, sarama.ByteEncoder(data))
-		if err != nil {
-			panic(err.Error())
-		}
-	}
-}
+// func oldreplayS3Obj(producer *sarama.Producer, s3bucket *s3.Bucket, s3key string, topic string, partitionKey KaasPartitionEncoder) {
+// 	contentBytes, err := s3bucket.Get(s3key)
+// 	if err != nil {
+// 		println(err.Error())
+// 		return
+// 	}
+// 	lines := strings.Split(string(contentBytes), "\n")
+// 	var data []byte = nil
+// 	for _, line := range lines {
+// 		// parse line to get actual data, ignoring the first token, which is metadata for topic id, offset, etc
+// 		if line != "" {
+// 			validKaasPrefix := regexp.MustCompile(`t_\w+-p_\d+-o_\d+\|`)
+// 			if validKaasPrefix.MatchString(line) {
+// 				if data != nil {
+// 					err := producer.SendMessage(topic, partitionKey, sarama.ByteEncoder(data))
+// 					if err != nil {
+// 						panic(err.Error())
+// 					}
+// 				}
+// 				tokens := strings.SplitN(line, "|", 2)
+// 				data = []byte(tokens[1])
+// 			} else {
+// 				data = append(data, []byte("\n")...)
+// 				data = append(data, []byte(line)...)
+// 			}
+// 		}
+// 	}
+// 	if data != nil {
+// 		err := producer.SendMessage(topic, partitionKey, sarama.ByteEncoder(data))
+// 		if err != nil {
+// 			panic(err.Error())
+// 		}
+// 	}
+// }
 
 // TODO: this should query from kaas api
 // Or authenticate against kaas to get temp token that only has access to the right dir
@@ -200,4 +224,40 @@ func read_uint64(data []byte) (ret uint64) {
 	buf := bytes.NewBuffer(data)
 	binary.Read(buf, binary.LittleEndian, &ret)
 	return
+}
+
+func sendProgressUpdate(replayId int, done int, total int) {
+	updateUrl, _ := config.GetString("server", "replay_url")
+	user, _ := config.GetString("server", "user")
+	token, _ := config.GetString("server", "token")
+
+	updateUrl = fmt.Sprintf("%s/%d", updateUrl, replayId)
+
+	client := &http.Client{}
+
+	replayStruct := ReplayStruct{
+		Progress: done * 100 / total,
+	}
+
+	if done == total {
+		println("IT IS COMPLETED")
+		replayStruct.Result = "completed"
+	}
+
+	replayUpdate := UpdateRequest{
+		Replay:     replayStruct,
+		User_email: user,
+		User_token: token,
+	}
+
+	data, err := json.Marshal(replayUpdate)
+	if err != nil {
+		panic(err.Error())
+	}
+
+	buf := bytes.NewBuffer(data)
+
+	req, _ := http.NewRequest("PUT", updateUrl, buf)
+	req.Header.Add("Content-Type", "application/json")
+	client.Do(req)
 }

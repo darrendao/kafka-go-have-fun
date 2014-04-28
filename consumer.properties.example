@@ -17,3 +17,8 @@ bucket=kaas-kafka-backup
 region=us-west-1
 accesskey=ACCESS
 secretkey=SECRET
+
+[server]
+replay_url=http://localhost:3000/replays
+token=SECRET
+user=admin@example.com
